@@ -5,19 +5,19 @@
 // <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
+use super::net;
 use grammers_mtproto::mtp;
-use grammers_mtsender::{self as sender, ReconnectionPolicy, Sender, ServerAddr};
+use grammers_mtsender::enqueuer::Enqueuer;
+use grammers_mtsender::sender::Sender;
+use grammers_mtsender::{ReconnectionPolicy, ServerAddr};
 use grammers_session::{ChatHashCache, MessageBoxes, Session, State};
 use grammers_tl_types as tl;
-use sender::Enqueuer;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use web_time::Instant;
-
-use super::net;
 
 /// When no locale is found, use this one instead.
 const DEFAULT_LOCALE: &str = "en";

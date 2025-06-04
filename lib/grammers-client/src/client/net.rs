@@ -11,13 +11,12 @@ use crate::utils;
 use grammers_mtproto::mtp;
 use grammers_mtproto::transport;
 use grammers_mtsender::ServerAddr;
-use grammers_mtsender::{
-    self as sender, AuthorizationError, InvocationError, RpcError, Sender, utils::sleep,
-};
+use grammers_mtsender::enqueuer::Enqueuer;
+use grammers_mtsender::sender::Sender;
+use grammers_mtsender::{AuthorizationError, InvocationError, RpcError, sender, utils::sleep};
 use grammers_session::{ChatHashCache, MessageBoxes};
 use grammers_tl_types::{self as tl, Deserializable};
 use log::{debug, info};
-use sender::Enqueuer;
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
