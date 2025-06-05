@@ -58,7 +58,7 @@ fn test_invoke_encrypted_method() {
             },
         });
         loop {
-            sender.step().await.unwrap();
+            //sender.step().await.unwrap();
             if let Ok(response) = rx.try_recv() {
                 match response {
                     Ok(body) => {

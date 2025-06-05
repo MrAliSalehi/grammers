@@ -15,6 +15,7 @@ pub enum ReadError {
     Io(io::Error),
     Transport(transport::Error),
     Deserialize(mtp::DeserializeError),
+    RxClosed,
 }
 
 impl std::error::Error for ReadError {}
@@ -29,6 +30,7 @@ impl Clone for ReadError {
             ),
             Self::Transport(e) => Self::Transport(e.clone()),
             Self::Deserialize(e) => Self::Deserialize(e.clone()),
+            Self::RxClosed => Self::RxClosed,
         }
     }
 }
@@ -39,6 +41,7 @@ impl fmt::Display for ReadError {
             Self::Io(err) => write!(f, "read error, IO failed: {err}"),
             Self::Transport(err) => write!(f, "read error, transport-level: {err}"),
             Self::Deserialize(err) => write!(f, "read error, bad response: {err}"),
+            Self::RxClosed => write!(f, "update receiver is closed"),
         }
     }
 }

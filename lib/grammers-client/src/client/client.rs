@@ -139,7 +139,7 @@ pub(crate) struct ClientState {
 }
 
 pub(crate) struct Connection {
-    pub(crate) sender: AsyncMutex<Sender<net::Transport, mtp::Encrypted>>,
+    pub(crate) sender: AsyncMutex<Sender<mtp::Encrypted>>,
     pub(crate) request_tx: RwLock<Enqueuer>,
     pub(crate) step_counter: AtomicU32,
 }

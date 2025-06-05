@@ -18,9 +18,10 @@ use grammers_mtproto::{
 };
 use grammers_tl_types::{self as tl, RemoteCall};
 use log::{debug, error, info, trace, warn};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::{io, io::Error, ops::ControlFlow, pin::pin, sync::Arc, time::Duration};
 use tl::Serializable;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -31,26 +32,26 @@ use web_time::Instant;
 pub type Requests = Arc<Mutex<Vec<Request>>>;
 
 /// Manages enqueuing requests, matching them to their response, and IO.
-pub struct Sender<T: Transport, M: Mtp> {
-    stream: NetStream,
-    transport: T,
-    mtp: M,
+pub struct Sender<M: Mtp> {
+    mtp: Arc<RwLock<M>>,
     addr: ServerAddr,
     requests: Vec<Request>,
     request_rx: mpsc::UnboundedReceiver<Request>,
-    next_ping: Instant,
     reconnection_policy: &'static dyn ReconnectionPolicy,
-
-    // Transport-level buffers and positions
-    read_buffer: Vec<u8>,
-    read_tail: usize,
     write_buffer: DequeBuffer<u8>,
     write_head: usize,
     handles: Vec<JoinHandle<()>>,
+    /*next_ping: Instant,
+    stream: NetStream,
+    transport: T,
+    // Transport-level buffers and positions
+    read_buffer: Vec<u8>,
+    read_tail: usize,*/
+    update_rx: broadcast::Receiver<Vec<tl::enums::Updates>>,
 }
 
-impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sender<T, M> {
-    async fn connect(
+impl<M: Mtp + Send + Sync + 'static> Sender<M> {
+    async fn connect<T: Transport + Send + Sync + 'static>(
         transport: T,
         mtp: M,
         addr: ServerAddr,
@@ -58,27 +59,30 @@ impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sende
     ) -> Result<(Self, Enqueuer), Error> {
         let stream = NetStream::connect(&addr).await?;
         let (mut reader, write) = stream.into_split();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
+        let (tx, rx) = mpsc::unbounded_channel::<Request>();
 
-        /*let slf = Self {
-            stream,
-            transport,
-            mtp,
+        let (update_tx, update_rx) = broadcast::channel::<Vec<tl::enums::Updates>>(5);
+        let m = Arc::new(RwLock::new(mtp));
+
+        let mut slf = Self {
+            update_rx,
+            mtp: m.clone(),
             addr,
             requests: vec![],
             request_rx: rx,
-            next_ping: Instant::now() + PING_DELAY,
             reconnection_policy,
             handles: vec![],
-            read_buffer: vec![0; MAXIMUM_DATA],
-            read_tail: 0,
             write_buffer: DequeBuffer::with_capacity(MAXIMUM_DATA, LEADING_BUFFER_SPACE),
             write_head: 0,
-        };*/
+            /* stream,
+            transport,
+            next_ping: Instant::now() + PING_DELAY,
+            read_buffer: vec![0; MAXIMUM_DATA],
+            read_tail: 0,*/
+        };
         let requests = Arc::new(Mutex::new(Vec::<Request>::new()));
 
         let t = transport.clone();
-        let m = Arc::new(RwLock::new(mtp));
 
         let read_handle = tokio::spawn(async move {
             let transport = t.clone();
@@ -86,30 +90,36 @@ impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sende
             let mtp = m.clone();
             let mut read_tail = 0;
             let mut read_buffer = vec![0; MAXIMUM_DATA];
-            let Ok(n) = reader
-                .read(&mut read_buffer[read_tail..])
-                .await
-                .inspect_err(|e| error!("read error: {e}"))
-            else {
-                return;
-            };
-            //fixme what to do with the updates
-            let result = on_net_read(
-                requests.clone(),
-                &mut read_tail,
-                &mut read_buffer,
-                &transport,
-                mtp.clone(),
-                n,
-            )
-            .inspect_err(|_e| {
-                //todo error on read
-                //Sender::on_error(e);
-            });
+            loop {
+                let Ok(n) = reader
+                    .read(&mut read_buffer[read_tail..])
+                    .await
+                    .inspect_err(|e| error!("read error: {e}"))
+                else {
+                    return;
+                };
+
+                let Ok(updates) = on_net_read(
+                    requests.clone(),
+                    &mut read_tail,
+                    &mut read_buffer,
+                    &transport,
+                    mtp.clone(),
+                    n,
+                ) else {
+                    //todo error on read
+                    //Sender::on_error(e);
+                    continue;
+                };
+
+                //todo handle the case where update_rx is closed.
+                update_tx.send(updates).unwrap();
+            }
         });
 
-        /*Ok((slf, Enqueuer(tx)))*/
-        todo!()
+        //add writer
+        slf.handles = vec![read_handle];
+        Ok((slf, Enqueuer(tx)))
     }
 
     pub async fn invoke<R: RemoteCall>(&mut self, request: &R) -> Result<Vec<u8>, InvocationError> {
@@ -148,7 +158,6 @@ impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sende
         mut rx: oneshot::Receiver<Result<Vec<u8>, InvocationError>>,
     ) -> Result<Vec<u8>, InvocationError> {
         loop {
-            self.step().await?;
             match rx.try_recv() {
                 Ok(x) => break x,
                 Err(TryRecvError::Empty) => continue,
@@ -158,8 +167,10 @@ impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sende
             }
         }
     }
-
-    /// Step network events, writing and reading at the same time.
+    pub async fn step(&mut self) -> Result<Vec<tl::enums::Updates>, ReadError> {
+        self.update_rx.recv().await.map_err(|_| ReadError::RxClosed)
+    }
+    /*    /// Step network events, writing and reading at the same time.
     ///
     /// Updates received during this step, if any, are returned.
     pub async fn step(&mut self) -> Result<Vec<tl::enums::Updates>, ReadError> {
@@ -403,7 +414,7 @@ impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sende
             .for_each(|r| drop(r.result.send(Err(InvocationError::from(error.clone())))));
 
         Err(error)
-    }
+    }*/
 }
 
 /// Handle `n` more read bytes being ready to process by the transport.
@@ -454,9 +465,9 @@ fn on_net_read<T: Transport, M: Mtp>(
     Ok(updates)
 }
 
-impl<T: Transport> Sender<T, mtp::Encrypted> {
+impl Sender<mtp::Encrypted> {
     pub fn auth_key(&self) -> [u8; 256] {
-        self.mtp.auth_key()
+        self.mtp.read().auth_key()
     }
 }
 
@@ -464,9 +475,9 @@ pub async fn connect<T: Transport + Send + Sync + 'static>(
     transport: T,
     addr: ServerAddr,
     rc_policy: &'static dyn ReconnectionPolicy,
-) -> Result<(Sender<T, mtp::Encrypted>, Enqueuer), AuthorizationError> {
+) -> Result<(Sender<mtp::Encrypted>, Enqueuer), AuthorizationError> {
     let (sender, enqueuer) = Sender::connect(transport, mtp::Plain::new(), addr, rc_policy).await?;
-    generate_auth_key(sender, enqueuer).await
+    generate_auth_key::<T>(sender, enqueuer).await
 }
 
 pub async fn connect_with_auth<T: Transport + Send + Sync + 'static>(
@@ -474,7 +485,7 @@ pub async fn connect_with_auth<T: Transport + Send + Sync + 'static>(
     addr: ServerAddr,
     auth_key: [u8; 256],
     rc_policy: &'static dyn ReconnectionPolicy,
-) -> Result<(Sender<T, mtp::Encrypted>, Enqueuer), Error> {
+) -> Result<(Sender<mtp::Encrypted>, Enqueuer), Error> {
     Sender::connect(
         transport,
         mtp::Encrypted::build().finish(auth_key),
@@ -485,9 +496,9 @@ pub async fn connect_with_auth<T: Transport + Send + Sync + 'static>(
 }
 
 async fn generate_auth_key<T: Transport + Send + Sync + 'static>(
-    mut sender: Sender<T, mtp::Plain>,
+    mut sender: Sender<mtp::Plain>,
     enqueuer: Enqueuer,
-) -> Result<(Sender<T, mtp::Encrypted>, Enqueuer), AuthorizationError> {
+) -> Result<(Sender<mtp::Encrypted>, Enqueuer), AuthorizationError> {
     info!("generating new authorization key...");
     let (request, data) = authentication::step1()?;
     debug!("gen auth key: sending step 1");
@@ -510,17 +521,20 @@ async fn generate_auth_key<T: Transport + Send + Sync + 'static>(
 
     Ok((
         Sender {
-            mtp: mtp::Encrypted::build()
-                .time_offset(time_offset)
-                .first_salt(first_salt)
-                .finish(auth_key),
-            next_ping: Instant::now() + PING_DELAY,
+            mtp: Arc::new(RwLock::new(
+                mtp::Encrypted::build()
+                    .time_offset(time_offset)
+                    .first_salt(first_salt)
+                    .finish(auth_key),
+            )),
+            /*next_ping: Instant::now() + PING_DELAY,
             stream: sender.stream,
             transport: sender.transport,
+            read_buffer: sender.read_buffer,
+            //read_tail: sender.read_tail,*/
+            update_rx: sender.update_rx,
             requests: sender.requests,
             request_rx: sender.request_rx,
-            read_buffer: sender.read_buffer,
-            read_tail: sender.read_tail,
             write_buffer: sender.write_buffer,
             write_head: sender.write_head,
             addr: sender.addr,

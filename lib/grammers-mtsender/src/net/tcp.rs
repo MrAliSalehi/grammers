@@ -6,11 +6,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use super::ServerAddr;
 use log::info;
 use tokio::net::TcpStream;
-pub use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use super::ServerAddr;
+pub use tokio::net::tcp::{ReadHalf, WriteHalf};
 
 pub enum NetStream {
     Tcp(TcpStream),
@@ -26,7 +26,7 @@ impl NetStream {
             Self::ProxySocks5(stream) => stream.into_split(),
         }
     }
-    
+
     pub(crate) fn split(&mut self) -> (ReadHalf, WriteHalf) {
         match self {
             Self::Tcp(stream) => stream.split(),

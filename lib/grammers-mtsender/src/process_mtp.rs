@@ -1,12 +1,14 @@
-use std::sync::Arc;
+use crate::sender::Requests;
+use crate::{InvocationError, Request, RequestState, RpcError};
+use grammers_mtproto::MsgId;
+use grammers_mtproto::mtp::{
+    BadMessage, Deserialization, DeserializationFailure, RpcResult, RpcResultError,
+};
+use grammers_tl_types as tl;
+use grammers_tl_types::Deserializable;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
-use grammers_mtproto::MsgId;
-use grammers_tl_types as tl;
-use grammers_mtproto::mtp::{BadMessage, Deserialization, DeserializationFailure, RpcResult, RpcResultError};
-use grammers_tl_types::Deserializable;
-use crate::{InvocationError, Request, RequestState, RpcError};
-use crate::sender::Requests;
+use std::sync::Arc;
 
 /// Process the result of deserializing an MTP buffer.
 pub fn process_mtp_buffer(
@@ -36,18 +38,18 @@ fn process_update(updates: &mut Vec<tl::enums::Updates>, update: Vec<u8>) {
             // update that actually occured.
             match tl::enums::messages::AffectedMessages::from_bytes(&update) {
                 Ok(tl::enums::messages::AffectedMessages::Messages(
-                       tl::types::messages::AffectedMessages { pts, pts_count },
-                   )) => Some(
+                    tl::types::messages::AffectedMessages { pts, pts_count },
+                )) => Some(
                     tl::types::UpdateShort {
                         update: tl::types::UpdateDeleteMessages {
                             messages: Vec::new(),
                             pts,
                             pts_count,
                         }
-                            .into(),
+                        .into(),
                         date: 0,
                     }
-                        .into(),
+                    .into(),
                 ),
                 Err(_) => match tl::types::messages::InvitedUsers::from_bytes(&update) {
                     Ok(u) => Some(u.updates),
@@ -111,45 +113,45 @@ fn process_bad_message(requests: Requests, bad_msg: BadMessage) {
     for i in (0..requests.len()).rev() {
         match &requests[i].state {
             RequestState::Serialized(pair)
-            if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
-                {
-                    panic!(
-                        "bad msg for unsent request {:?}: {}",
-                        bad_msg.msg_id,
-                        bad_msg.description()
-                    );
-                }
+                if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
+            {
+                panic!(
+                    "bad msg for unsent request {:?}: {}",
+                    bad_msg.msg_id,
+                    bad_msg.description()
+                );
+            }
             RequestState::Sent(pair)
-            if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
-                {
-                    // TODO add a test to make sure we resend the request
-                    if bad_msg.retryable() {
-                        info!(
+                if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
+            {
+                // TODO add a test to make sure we resend the request
+                if bad_msg.retryable() {
+                    info!(
                         "{}; re-sending request {:?}",
                         bad_msg.description(),
                         pair.msg_id
                     );
 
-                        // TODO check if actually retryable first!
-                        requests[i].state = RequestState::NotSerialized;
+                    // TODO check if actually retryable first!
+                    requests[i].state = RequestState::NotSerialized;
+                } else {
+                    if bad_msg.fatal() {
+                        error!(
+                            "{}; canont retry request {:?}",
+                            bad_msg.description(),
+                            pair.msg_id
+                        );
                     } else {
-                        if bad_msg.fatal() {
-                            error!(
+                        warn!(
                             "{}; canont retry request {:?}",
                             bad_msg.description(),
                             pair.msg_id
                         );
-                        } else {
-                            warn!(
-                            "{}; canont retry request {:?}",
-                            bad_msg.description(),
-                            pair.msg_id
-                        );
-                        }
-                        let req = requests.swap_remove(i);
-                        drop(req.result.send(Err(InvocationError::Dropped)));
                     }
+                    let req = requests.swap_remove(i);
+                    drop(req.result.send(Err(InvocationError::Dropped)));
                 }
+            }
             _ => {}
         }
     }

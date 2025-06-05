@@ -65,7 +65,7 @@ const DEFAULT_DC: i32 = 2;
 pub(crate) async fn connect_sender(
     dc_id: i32,
     config: &Config,
-) -> Result<(Sender<Transport, mtp::Encrypted>, Enqueuer), AuthorizationError> {
+) -> Result<(Sender<mtp::Encrypted>, Enqueuer), AuthorizationError> {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     let transport = transport::Full::new();
 
@@ -413,7 +413,7 @@ impl Client {
 }
 
 impl Connection {
-    fn new(sender: Sender<Transport, mtp::Encrypted>, request_tx: Enqueuer) -> Self {
+    fn new(sender: Sender<mtp::Encrypted>, request_tx: Enqueuer) -> Self {
         Self {
             sender: AsyncMutex::new(sender),
             request_tx: RwLock::new(request_tx),
