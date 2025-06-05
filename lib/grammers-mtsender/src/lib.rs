@@ -14,6 +14,7 @@ mod net;
 mod reconnection;
 pub mod sender;
 pub mod utils;
+pub mod process_mtp;
 
 pub use crate::reconnection::*;
 pub use errors::{AuthorizationError, InvocationError, ReadError, RpcError};

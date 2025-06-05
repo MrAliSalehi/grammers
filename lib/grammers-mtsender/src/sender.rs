@@ -1,4 +1,5 @@
 use crate::generate_random_id;
+use crate::process_mtp::process_mtp_buffer;
 pub use crate::{
     LEADING_BUFFER_SPACE, MAXIMUM_DATA, MsgIdPair, NO_PING_DISCONNECT, PING_DELAY, Request,
     RequestState,
@@ -10,20 +11,15 @@ pub use crate::{
 };
 use futures_util::future::{Either, pending, select};
 use grammers_crypto::DequeBuffer;
-use grammers_mtproto::transport::Intermediate;
 use grammers_mtproto::{
-    MsgId, authentication,
-    mtp::{
-        self, BadMessage, Deserialization, DeserializationFailure, Mtp, RpcResult, RpcResultError,
-    },
+    authentication,
+    mtp::{self, Mtp},
     transport::{self, Transport},
 };
-use grammers_tl_types::{self as tl, Deserializable, RemoteCall};
+use grammers_tl_types::{self as tl, RemoteCall};
 use log::{debug, error, info, trace, warn};
-use parking_lot::RwLock;
-use std::ops::Deref;
-use std::sync::Arc;
-use std::{io, io::Error, ops::ControlFlow, pin::pin, time::Duration};
+use parking_lot::{Mutex, RwLock};
+use std::{io, io::Error, ops::ControlFlow, pin::pin, sync::Arc, time::Duration};
 use tl::Serializable;
 use tokio::task::JoinHandle;
 use tokio::{
@@ -31,6 +27,8 @@ use tokio::{
     sync::{mpsc, oneshot, oneshot::error::TryRecvError},
 };
 use web_time::Instant;
+
+pub type Requests = Arc<Mutex<Vec<Request>>>;
 
 /// Manages enqueuing requests, matching them to their response, and IO.
 pub struct Sender<T: Transport, M: Mtp> {
@@ -77,12 +75,14 @@ impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sende
             write_buffer: DequeBuffer::with_capacity(MAXIMUM_DATA, LEADING_BUFFER_SPACE),
             write_head: 0,
         };*/
+        let requests = Arc::new(Mutex::new(Vec::<Request>::new()));
 
         let t = transport.clone();
         let m = Arc::new(RwLock::new(mtp));
 
         let read_handle = tokio::spawn(async move {
             let transport = t.clone();
+            let requests = requests.clone();
             let mtp = m.clone();
             let mut read_tail = 0;
             let mut read_buffer = vec![0; MAXIMUM_DATA];
@@ -93,8 +93,19 @@ impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sende
             else {
                 return;
             };
-            //what to do with the updates
-            let result = on_net_read(&mut read_tail, &mut read_buffer, &transport, mtp.clone(), n);
+            //fixme what to do with the updates
+            let result = on_net_read(
+                requests.clone(),
+                &mut read_tail,
+                &mut read_buffer,
+                &transport,
+                mtp.clone(),
+                n,
+            )
+            .inspect_err(|_e| {
+                //todo error on read
+                //Sender::on_error(e);
+            });
         });
 
         /*Ok((slf, Enqueuer(tx)))*/
@@ -193,7 +204,9 @@ impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sende
                 self.requests.push(request.unwrap());
                 Ok(Vec::new())
             }
-            Sel::Read(n) => n.map_err(ReadError::Io).and_then(|n| /*self.on_net_read(n)*/ todo!()),
+            Sel::Read(n) => n
+                .map_err(ReadError::Io)
+                .and_then(|n| /*self.on_net_read(n)*/ todo!()),
             Sel::Write(n) => n.map_err(ReadError::Io).map(|n| {
                 self.on_net_write(n);
                 Vec::new()
@@ -391,187 +404,13 @@ impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sende
 
         Err(error)
     }
-
-    /// Process the result of deserializing an MTP buffer.
-    fn process_mtp_buffer(
-        &mut self,
-        results: Vec<Deserialization>,
-        updates: &mut Vec<tl::enums::Updates>,
-    ) {
-        for result in results {
-            match result {
-                Deserialization::Update(update) => self.process_update(updates, update),
-                Deserialization::RpcResult(result) => self.process_result(result),
-                Deserialization::RpcError(error) => self.process_error(error),
-                Deserialization::BadMessage(bad_msg) => self.process_bad_message(bad_msg),
-                Deserialization::Failure(failure) => self.process_deserialize_error(failure),
-            }
-        }
-    }
-
-    fn process_update(&mut self, updates: &mut Vec<tl::enums::Updates>, update: Vec<u8>) {
-        let update = match tl::enums::Updates::from_bytes(&update) {
-            Ok(u) => Some(u),
-            Err(e) => {
-                // Annoyingly enough, `messages.affectedMessages` also has `pts`.
-                // Mostly received when deleting messages, so pretend that's the
-                // update that actually occured.
-                match tl::enums::messages::AffectedMessages::from_bytes(&update) {
-                    Ok(tl::enums::messages::AffectedMessages::Messages(
-                        tl::types::messages::AffectedMessages { pts, pts_count },
-                    )) => Some(
-                        tl::types::UpdateShort {
-                            update: tl::types::UpdateDeleteMessages {
-                                messages: Vec::new(),
-                                pts,
-                                pts_count,
-                            }
-                            .into(),
-                            date: 0,
-                        }
-                        .into(),
-                    ),
-                    Err(_) => match tl::types::messages::InvitedUsers::from_bytes(&update) {
-                        Ok(u) => Some(u.updates),
-                        Err(_) => {
-                            warn!(
-                                "telegram sent updates that failed to be deserialized: {}",
-                                e
-                            );
-                            None
-                        }
-                    },
-                }
-            }
-        };
-
-        if let Some(update) = update {
-            updates.push(update);
-        }
-    }
-
-    fn process_result(&mut self, result: RpcResult) {
-        if let Some(req) = self.pop_request(result.msg_id) {
-            let x = result.body;
-            assert!(x.len() >= 4);
-            let res_id = u32::from_le_bytes([x[0], x[1], x[2], x[3]]);
-            debug!(
-                "got result {:x} ({}) for request {:?}",
-                res_id,
-                tl::name_for_id(res_id),
-                result.msg_id
-            );
-            drop(req.result.send(Ok(x)));
-        } else {
-            info!(
-                "got rpc result {:?} but no such request is saved",
-                result.msg_id
-            );
-        }
-    }
-
-    fn process_error(&mut self, error: RpcResultError) {
-        if let Some(req) = self.pop_request(error.msg_id) {
-            debug!("got rpc error {:?}", error.error);
-            let x = req.body.as_slice();
-            drop(
-                req.result.send(Err(InvocationError::Rpc(
-                    RpcError::from(error.error)
-                        .with_caused_by(u32::from_le_bytes([x[0], x[1], x[2], x[3]])),
-                ))),
-            );
-        } else {
-            info!(
-                "got rpc error {:?} but no such request is saved",
-                error.msg_id
-            );
-        }
-    }
-
-    fn process_bad_message(&mut self, bad_msg: BadMessage) {
-        for i in (0..self.requests.len()).rev() {
-            match &self.requests[i].state {
-                RequestState::Serialized(pair)
-                    if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
-                {
-                    panic!(
-                        "bad msg for unsent request {:?}: {}",
-                        bad_msg.msg_id,
-                        bad_msg.description()
-                    );
-                }
-                RequestState::Sent(pair)
-                    if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
-                {
-                    // TODO add a test to make sure we resend the request
-                    if bad_msg.retryable() {
-                        info!(
-                            "{}; re-sending request {:?}",
-                            bad_msg.description(),
-                            pair.msg_id
-                        );
-
-                        // TODO check if actually retryable first!
-                        self.requests[i].state = RequestState::NotSerialized;
-                    } else {
-                        if bad_msg.fatal() {
-                            error!(
-                                "{}; canont retry request {:?}",
-                                bad_msg.description(),
-                                pair.msg_id
-                            );
-                        } else {
-                            warn!(
-                                "{}; canont retry request {:?}",
-                                bad_msg.description(),
-                                pair.msg_id
-                            );
-                        }
-                        let req = self.requests.swap_remove(i);
-                        drop(req.result.send(Err(InvocationError::Dropped)));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn process_deserialize_error(&mut self, failure: DeserializationFailure) {
-        if let Some(req) = self.pop_request(failure.msg_id) {
-            debug!("got deserialization failure {:?}", failure.error);
-            drop(
-                req.result
-                    .send(Err(InvocationError::Read(failure.error.into()))),
-            );
-        } else {
-            info!(
-                "got deserialization failure {:?} but no such request is saved",
-                failure.error
-            );
-        }
-    }
-
-    fn pop_request(&mut self, msg_id: MsgId) -> Option<Request> {
-        for i in 0..self.requests.len() {
-            match &self.requests[i].state {
-                RequestState::Serialized(pair) if pair.msg_id == msg_id => {
-                    panic!("got response {msg_id:?} for unsent request {pair:?}");
-                }
-                RequestState::Sent(pair) if pair.msg_id == msg_id => {
-                    return Some(self.requests.swap_remove(i));
-                }
-                _ => {}
-            }
-        }
-
-        None
-    }
 }
 
 /// Handle `n` more read bytes being ready to process by the transport.
 ///
 /// This won't cause `ReadError::Io`, but yet another enum would be overkill.
 fn on_net_read<T: Transport, M: Mtp>(
+    requests: Requests,
     read_tail: &mut usize,
     read_buffer: &mut Vec<u8>,
     t: &T,
@@ -601,8 +440,7 @@ fn on_net_read<T: Transport, M: Mtp>(
                     .write()
                     .deserialize(&read_buffer[next_offset..][offset.data_start..offset.data_end])?;
 
-                //todo fix the process
-                //Sender::process_mtp_buffer(result, &mut updates);
+                process_mtp_buffer(result, &mut updates, requests.clone());
                 next_offset += offset.next_offset;
             }
             Err(transport::Error::MissingBytes) => break,
@@ -646,7 +484,7 @@ pub async fn connect_with_auth<T: Transport + Send + Sync + 'static>(
     .await
 }
 
-pub async fn generate_auth_key<T: Transport + Send + Sync + 'static>(
+async fn generate_auth_key<T: Transport + Send + Sync + 'static>(
     mut sender: Sender<T, mtp::Plain>,
     enqueuer: Enqueuer,
 ) -> Result<(Sender<T, mtp::Encrypted>, Enqueuer), AuthorizationError> {
