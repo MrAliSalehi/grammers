@@ -86,19 +86,19 @@ impl fmt::Display for Error {
 }
 
 /// The trait used by the transports to create instances of themselves.
-pub trait Transport {
+pub trait Transport:Clone {
     /// Packs the input buffer in-place.
     ///
     /// Panics if `input.len()` is not divisible by 4.
-    fn pack(&mut self, buffer: &mut DequeBuffer<u8>);
+    fn pack(&self, buffer: &mut DequeBuffer<u8>);
 
     /// Unpacks the input buffer in-place.
     /// Subsequent calls to `unpack` should be made with the same buffer,
     /// with the data on the ranges from previous `UnpackedOffset` removed.
-    fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error>;
+    fn unpack(&self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error>;
 
     /// Reset the state, as if a new instance was just created.
-    fn reset(&mut self);
+    fn reset(&self);
 }
 
 /// The trait used by the obfuscated transport to get the transport tags.

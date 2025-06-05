@@ -30,6 +30,7 @@ tokio-socks = { version = "0.5.2", optional = true }
 hickory-resolver = { version = "0.24.1", optional = true }
 url = { version = "2.5.2", optional = true }
 web-time = "1.1.0"
+parking_lot = "0.12.4"
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 tokio = { version = "1.40.0", default-features = false, features = ["net"] }

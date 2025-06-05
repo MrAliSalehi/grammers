@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 // Copyright 2020 - developers of the `grammers` project.
 //
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
@@ -25,8 +27,9 @@ use grammers_crypto::DequeBuffer;
 /// ```
 ///
 /// [intermediate transport]: https://core.telegram.org/mtproto/mtproto-transports#intermediate
+#[derive(Clone)]
 pub struct Intermediate {
-    init: bool,
+    init: Arc<AtomicBool>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -34,24 +37,26 @@ impl Intermediate {
     const TAG: [u8; 4] = 0xee_ee_ee_ee_u32.to_le_bytes();
 
     pub fn new() -> Self {
-        Self { init: false }
+        Self {
+            init: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
 impl Transport for Intermediate {
-    fn pack(&mut self, buffer: &mut DequeBuffer<u8>) {
+    fn pack(&self, buffer: &mut DequeBuffer<u8>) {
         let len = buffer.len();
         assert_eq!(len % 4, 0);
 
         buffer.extend_front(&(len as i32).to_le_bytes());
 
-        if !self.init {
+        if !self.init.load(Ordering::Relaxed) {
             buffer.extend_front(&Self::TAG);
-            self.init = true;
+            self.init.store(true, Ordering::Relaxed);
         }
     }
 
-    fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
+    fn unpack(&self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
         if buffer.len() < 4 {
             return Err(Error::MissingBytes);
         }
@@ -80,15 +85,15 @@ impl Transport for Intermediate {
         })
     }
 
-    fn reset(&mut self) {
+    fn reset(&self) {
         log::info!("resetting sending of header in intermediate transport");
-        self.init = false;
+        self.init.store(false, Ordering::Relaxed);
     }
 }
 
 impl Tagged for Intermediate {
     fn init_tag(&mut self) -> [u8; 4] {
-        self.init = true;
+        self.init.store(true, Ordering::Relaxed);
         Self::TAG
     }
 }

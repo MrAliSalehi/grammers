@@ -1,3 +1,5 @@
+use std::ops::Deref;
+use std::sync::Arc;
 // Copyright 2020 - developers of the `grammers` project.
 //
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
@@ -5,10 +7,10 @@
 // <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
+use super::{Error, Tagged, Transport, UnpackedOffset};
 use grammers_crypto::{DequeBuffer, obfuscated::ObfuscatedCipher};
 use log::debug;
-
-use super::{Error, Tagged, Transport, UnpackedOffset};
+use parking_lot::RwLock;
 
 /// An obfuscation protocol made by telegram to avoid ISP blocks.
 /// This is needed to connect to the Telegram servers using websockets or
@@ -23,8 +25,13 @@ use super::{Error, Tagged, Transport, UnpackedOffset};
 /// See the linked documentation for more information.
 ///
 /// [Transport Obfuscation](https://core.telegram.org/mtproto/mtproto-transports#transport-obfuscation)
+#[derive(Clone)]
 pub struct Obfuscated<T: Transport + Tagged> {
-    inner: T,
+    inner: Arc<RwLock<ObfuscatedInner<T>>>,
+}
+
+struct ObfuscatedInner<T: Transport + Tagged> {
+    t: T,
     head: Option<[u8; 64]>,
     decrypt_tail: usize,
     cipher: ObfuscatedCipher,
@@ -62,50 +69,55 @@ impl<T: Transport + Tagged> Obfuscated<T> {
         (init, cipher)
     }
 
-    pub fn new(mut inner: T) -> Self {
-        let (init, cipher) = Self::generate_keys(&mut inner);
+    pub fn new(mut t: T) -> Self {
+        let (init, cipher) = Self::generate_keys(&mut t);
 
         Self {
-            inner,
-            head: Some(init),
-            decrypt_tail: 0,
-            cipher,
+            inner: Arc::new(RwLock::new(ObfuscatedInner {
+                head: Some(init),
+                decrypt_tail: 0,
+                cipher,
+                t,
+            })),
         }
     }
 }
 
 impl<T: Transport + Tagged> Transport for Obfuscated<T> {
-    fn pack(&mut self, buffer: &mut DequeBuffer<u8>) {
-        self.inner.pack(buffer);
-        self.cipher.encrypt(buffer.as_mut());
-        if let Some(head) = self.head.take() {
+    fn pack(&self, buffer: &mut DequeBuffer<u8>) {
+        let mut inner = self.inner.write();
+        inner.t.pack(buffer);
+        inner.cipher.encrypt(buffer.as_mut());
+        if let Some(head) = inner.head.take() {
             buffer.extend_front(&head);
         }
     }
 
-    fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
-        if buffer.len() < self.decrypt_tail {
+    fn unpack(&self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
+        let mut inner = self.inner.write();
+        if buffer.len() < inner.decrypt_tail {
             panic!("buffer is smaller than what was decrypted");
         }
 
-        self.cipher.decrypt(&mut buffer[self.decrypt_tail..]);
-        self.decrypt_tail = buffer.len();
+        let decrypt_tail = inner.decrypt_tail;
+        inner.cipher.decrypt(&mut buffer[decrypt_tail..]);
+        inner.decrypt_tail = buffer.len();
 
-        match self.inner.unpack(buffer) {
+        match inner.t.unpack(buffer) {
             Ok(offset) => {
-                self.decrypt_tail -= offset.next_offset;
+                inner.decrypt_tail -= offset.next_offset;
                 Ok(offset)
             }
             Err(e) => Err(e),
         }
     }
 
-    fn reset(&mut self) {
-        self.inner.reset();
+    fn reset(&self) {
         debug!("regenerating keys for obfuscated transport");
-
-        let (init, cipher) = Self::generate_keys(&mut self.inner);
-        self.head = Some(init);
-        self.cipher = cipher;
+        let mut inner = self.inner.write();
+        inner.t.reset();
+        let (init, cipher) = Self::generate_keys(&mut inner.t);
+        inner.head = Some(init);
+        inner.cipher = cipher;
     }
 }

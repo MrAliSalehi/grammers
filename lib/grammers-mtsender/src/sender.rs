@@ -10,6 +10,7 @@ pub use crate::{
 };
 use futures_util::future::{Either, pending, select};
 use grammers_crypto::DequeBuffer;
+use grammers_mtproto::transport::Intermediate;
 use grammers_mtproto::{
     MsgId, authentication,
     mtp::{
@@ -19,8 +20,12 @@ use grammers_mtproto::{
 };
 use grammers_tl_types::{self as tl, Deserializable, RemoteCall};
 use log::{debug, error, info, trace, warn};
+use parking_lot::RwLock;
+use std::ops::Deref;
+use std::sync::Arc;
 use std::{io, io::Error, ops::ControlFlow, pin::pin, time::Duration};
 use tl::Serializable;
+use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{mpsc, oneshot, oneshot::error::TryRecvError},
@@ -43,8 +48,10 @@ pub struct Sender<T: Transport, M: Mtp> {
     read_tail: usize,
     write_buffer: DequeBuffer<u8>,
     write_head: usize,
+    handles: Vec<JoinHandle<()>>,
 }
-impl<T: Transport, M: Mtp> Sender<T, M> {
+
+impl<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static> Sender<T, M> {
     async fn connect(
         transport: T,
         mtp: M,
@@ -52,25 +59,46 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         reconnection_policy: &'static dyn ReconnectionPolicy,
     ) -> Result<(Self, Enqueuer), Error> {
         let stream = NetStream::connect(&addr).await?;
-        let (tx, rx) = mpsc::unbounded_channel();
-        Ok((
-            Self {
-                stream,
-                transport,
-                mtp,
-                addr,
-                requests: vec![],
-                request_rx: rx,
-                next_ping: Instant::now() + PING_DELAY,
-                reconnection_policy,
+        let (mut reader, write) = stream.into_split();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Request>();
 
-                read_buffer: vec![0; MAXIMUM_DATA],
-                read_tail: 0,
-                write_buffer: DequeBuffer::with_capacity(MAXIMUM_DATA, LEADING_BUFFER_SPACE),
-                write_head: 0,
-            },
-            Enqueuer(tx),
-        ))
+        /*let slf = Self {
+            stream,
+            transport,
+            mtp,
+            addr,
+            requests: vec![],
+            request_rx: rx,
+            next_ping: Instant::now() + PING_DELAY,
+            reconnection_policy,
+            handles: vec![],
+            read_buffer: vec![0; MAXIMUM_DATA],
+            read_tail: 0,
+            write_buffer: DequeBuffer::with_capacity(MAXIMUM_DATA, LEADING_BUFFER_SPACE),
+            write_head: 0,
+        };*/
+
+        let t = transport.clone();
+        let m = Arc::new(RwLock::new(mtp));
+
+        let read_handle = tokio::spawn(async move {
+            let transport = t.clone();
+            let mtp = m.clone();
+            let mut read_tail = 0;
+            let mut read_buffer = vec![0; MAXIMUM_DATA];
+            let Ok(n) = reader
+                .read(&mut read_buffer[read_tail..])
+                .await
+                .inspect_err(|e| error!("read error: {e}"))
+            else {
+                return;
+            };
+            //what to do with the updates
+            let result = on_net_read(&mut read_tail, &mut read_buffer, &transport, mtp.clone(), n);
+        });
+
+        /*Ok((slf, Enqueuer(tx)))*/
+        todo!()
     }
 
     pub async fn invoke<R: RemoteCall>(&mut self, request: &R) -> Result<Vec<u8>, InvocationError> {
@@ -165,7 +193,7 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
                 self.requests.push(request.unwrap());
                 Ok(Vec::new())
             }
-            Sel::Read(n) => n.map_err(ReadError::Io).and_then(|n| self.on_net_read(n)),
+            Sel::Read(n) => n.map_err(ReadError::Io).and_then(|n| /*self.on_net_read(n)*/ todo!()),
             Sel::Write(n) => n.map_err(ReadError::Io).map(|n| {
                 self.on_net_write(n);
                 Vec::new()
@@ -264,50 +292,6 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
             }
             self.transport.pack(&mut self.write_buffer)
         }
-    }
-
-    /// Handle `n` more read bytes being ready to process by the transport.
-    ///
-    /// This won't cause `ReadError::Io`, but yet another enum would be overkill.
-    fn on_net_read(&mut self, n: usize) -> Result<Vec<tl::enums::Updates>, ReadError> {
-        if n == 0 {
-            return Err(ReadError::Io(Error::new(
-                io::ErrorKind::ConnectionReset,
-                "read 0 bytes",
-            )));
-        }
-
-        self.read_tail += n;
-        trace!("read {} bytes from the network", n);
-        trace!("trying to unpack buffer of {} bytes...", self.read_tail);
-
-        // TODO the buffer might have multiple transport packets, what should happen with the
-        // updates successfully read if subsequent packets fail to be deserialized properly?
-        let mut updates = Vec::new();
-        let mut next_offset = 0;
-        while next_offset != self.read_tail {
-            match self
-                .transport
-                .unpack(&mut self.read_buffer[next_offset..self.read_tail])
-            {
-                Ok(offset) => {
-                    debug!("deserializing valid transport packet...");
-                    let result = self.mtp.deserialize(
-                        &self.read_buffer[next_offset..][offset.data_start..offset.data_end],
-                    )?;
-
-                    self.process_mtp_buffer(result, &mut updates);
-                    next_offset += offset.next_offset;
-                }
-                Err(transport::Error::MissingBytes) => break,
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        self.read_buffer.copy_within(next_offset..self.read_tail, 0);
-        self.read_tail -= next_offset;
-
-        Ok(updates)
     }
 
     /// Handle `n` more written bytes being ready to process by the transport.
@@ -584,13 +568,61 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
     }
 }
 
+/// Handle `n` more read bytes being ready to process by the transport.
+///
+/// This won't cause `ReadError::Io`, but yet another enum would be overkill.
+fn on_net_read<T: Transport, M: Mtp>(
+    read_tail: &mut usize,
+    read_buffer: &mut Vec<u8>,
+    t: &T,
+    m: Arc<RwLock<M>>,
+    n: usize,
+) -> Result<Vec<tl::enums::Updates>, ReadError> {
+    if n == 0 {
+        return Err(ReadError::Io(Error::new(
+            io::ErrorKind::ConnectionReset,
+            "read 0 bytes",
+        )));
+    }
+
+    *read_tail += n;
+    trace!("read {} bytes from the network", n);
+    trace!("trying to unpack buffer of {} bytes...", read_tail);
+
+    // TODO the buffer might have multiple transport packets, what should happen with the
+    // updates successfully read if subsequent packets fail to be deserialized properly?
+    let mut updates = Vec::new();
+    let mut next_offset = 0;
+    while next_offset != *read_tail {
+        match t.unpack(&mut read_buffer[next_offset..*read_tail]) {
+            Ok(offset) => {
+                debug!("deserializing valid transport packet...");
+                let result = m
+                    .write()
+                    .deserialize(&read_buffer[next_offset..][offset.data_start..offset.data_end])?;
+
+                //todo fix the process
+                //Sender::process_mtp_buffer(result, &mut updates);
+                next_offset += offset.next_offset;
+            }
+            Err(transport::Error::MissingBytes) => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    read_buffer.copy_within(next_offset..*read_tail, 0);
+    *read_tail -= next_offset;
+
+    Ok(updates)
+}
+
 impl<T: Transport> Sender<T, mtp::Encrypted> {
     pub fn auth_key(&self) -> [u8; 256] {
         self.mtp.auth_key()
     }
 }
 
-pub async fn connect<T: Transport>(
+pub async fn connect<T: Transport + Send + Sync + 'static>(
     transport: T,
     addr: ServerAddr,
     rc_policy: &'static dyn ReconnectionPolicy,
@@ -599,7 +631,7 @@ pub async fn connect<T: Transport>(
     generate_auth_key(sender, enqueuer).await
 }
 
-pub async fn connect_with_auth<T: Transport>(
+pub async fn connect_with_auth<T: Transport + Send + Sync + 'static>(
     transport: T,
     addr: ServerAddr,
     auth_key: [u8; 256],
@@ -614,7 +646,7 @@ pub async fn connect_with_auth<T: Transport>(
     .await
 }
 
-pub async fn generate_auth_key<T: Transport>(
+pub async fn generate_auth_key<T: Transport + Send + Sync + 'static>(
     mut sender: Sender<T, mtp::Plain>,
     enqueuer: Enqueuer,
 ) -> Result<(Sender<T, mtp::Encrypted>, Enqueuer), AuthorizationError> {
@@ -640,21 +672,22 @@ pub async fn generate_auth_key<T: Transport>(
 
     Ok((
         Sender {
-            stream: sender.stream,
-            transport: sender.transport,
             mtp: mtp::Encrypted::build()
                 .time_offset(time_offset)
                 .first_salt(first_salt)
                 .finish(auth_key),
+            next_ping: Instant::now() + PING_DELAY,
+            stream: sender.stream,
+            transport: sender.transport,
             requests: sender.requests,
             request_rx: sender.request_rx,
-            next_ping: Instant::now() + PING_DELAY,
             read_buffer: sender.read_buffer,
             read_tail: sender.read_tail,
             write_buffer: sender.write_buffer,
             write_head: sender.write_head,
             addr: sender.addr,
             reconnection_policy: sender.reconnection_policy,
+            handles: sender.handles,
         },
         enqueuer,
     ))

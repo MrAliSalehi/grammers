@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 // Copyright 2020 - developers of the `grammers` project.
 //
 // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
@@ -26,30 +28,31 @@ use grammers_crypto::DequeBuffer;
 /// ```
 ///
 /// [full transport]: https://core.telegram.org/mtproto/mtproto-transports#full
+#[derive(Clone)]
 pub struct Full {
-    send_seq: i32,
-    recv_seq: i32,
+    send_seq: Arc<AtomicI32>,
+    recv_seq: Arc<AtomicI32>,
 }
 
 #[allow(clippy::new_without_default)]
 impl Full {
     pub fn new() -> Self {
         Self {
-            send_seq: 0,
-            recv_seq: 0,
+            send_seq: Arc::new(AtomicI32::new(0)),
+            recv_seq: Arc::new(AtomicI32::new(0)),
         }
     }
 }
 
 impl Transport for Full {
-    fn pack(&mut self, buffer: &mut DequeBuffer<u8>) {
+    fn pack(&self, buffer: &mut DequeBuffer<u8>) {
         let len = buffer.len();
         assert_eq!(len % 4, 0);
 
         // payload len + length itself (4 bytes) + send counter (4 bytes) + crc32 (4 bytes)
         let len = (len as i32) + 4 + 4 + 4;
 
-        buffer.extend_front(&self.send_seq.to_le_bytes());
+        buffer.extend_front(&self.send_seq.load(Ordering::Relaxed).to_le_bytes());
         buffer.extend_front(&len.to_le_bytes());
 
         let crc = {
@@ -59,10 +62,10 @@ impl Transport for Full {
         };
         buffer.extend(crc.to_le_bytes());
 
-        self.send_seq += 1;
+        self.send_seq.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn unpack(&mut self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
+    fn unpack(&self, buffer: &mut [u8]) -> Result<UnpackedOffset, Error> {
         // Need 4 bytes for the initial length
         if buffer.len() < 4 {
             return Err(Error::MissingBytes);
@@ -87,9 +90,10 @@ impl Transport for Full {
 
         // receive counter
         let seq = i32::from_le_bytes(buffer[4..8].try_into().unwrap());
-        if seq != self.recv_seq {
+        let recv_seq = self.recv_seq.load(Ordering::Relaxed);
+        if seq != recv_seq {
             return Err(Error::BadSeq {
-                expected: self.recv_seq,
+                expected: recv_seq,
                 got: seq,
             });
         }
@@ -111,7 +115,7 @@ impl Transport for Full {
             });
         }
 
-        self.recv_seq += 1;
+        self.recv_seq.fetch_add(1, Ordering::Relaxed);
         Ok(UnpackedOffset {
             data_start: 8,
             data_end: len - 4,
@@ -119,10 +123,10 @@ impl Transport for Full {
         })
     }
 
-    fn reset(&mut self) {
+    fn reset(&self) {
         log::info!("resetting recv and send seqs in full transport");
-        self.recv_seq = 0;
-        self.send_seq = 0;
+        self.recv_seq.store(0, Ordering::Relaxed);
+        self.send_seq.store(0, Ordering::Relaxed);
     }
 }
 
