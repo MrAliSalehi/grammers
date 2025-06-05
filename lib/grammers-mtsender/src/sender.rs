@@ -1,4 +1,3 @@
-use crate::generate_random_id;
 use crate::process_mtp::process_mtp_buffer;
 pub use crate::{
     LEADING_BUFFER_SPACE, MAXIMUM_DATA, MsgIdPair, NO_PING_DISCONNECT, PING_DELAY, Request,
@@ -9,7 +8,6 @@ pub use crate::{
     reconnection::*,
     utils::{sleep, sleep_until},
 };
-use futures_util::future::{Either, pending, select};
 use grammers_crypto::DequeBuffer;
 use grammers_mtproto::{
     authentication,
@@ -17,23 +15,21 @@ use grammers_mtproto::{
     transport::{self, Transport},
 };
 use grammers_tl_types::{self as tl, RemoteCall};
-use log::{debug, error, info, trace, warn};
-use parking_lot::{Condvar, Mutex, RwLock};
-use std::{io, io::Error, ops::ControlFlow, pin::pin, sync::Arc, time::Duration};
-use tl::Serializable;
+use log::{debug, error, info, trace};
+use parking_lot::{Mutex, RwLock};
+use std::{io, io::Error, sync::Arc};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncReadExt,
     sync::{mpsc, oneshot, oneshot::error::TryRecvError},
 };
-use web_time::Instant;
 
 pub type Requests = Arc<Mutex<Vec<Request>>>;
 
 /// Manages enqueuing requests, matching them to their response, and IO.
-pub struct Sender<M: Mtp> {
-    mtp: Arc<RwLock<M>>,
+pub struct Sender {
+    mtp: Arc<RwLock<Box<dyn Mtp + Send + Sync>>>,
     addr: ServerAddr,
     requests: Vec<Request>,
     request_rx: mpsc::UnboundedReceiver<Request>,
@@ -50,8 +46,8 @@ pub struct Sender<M: Mtp> {
     update_rx: broadcast::Receiver<Vec<tl::enums::Updates>>,
 }
 
-impl<M: Mtp + Send + Sync + 'static> Sender<M> {
-    async fn connect<T: Transport + Send + Sync + 'static>(
+impl Sender {
+    async fn connect<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static>(
         transport: T,
         mtp: M,
         addr: ServerAddr,
@@ -62,7 +58,8 @@ impl<M: Mtp + Send + Sync + 'static> Sender<M> {
         let (tx, rx) = mpsc::unbounded_channel::<Request>();
 
         let (update_tx, update_rx) = broadcast::channel::<Vec<tl::enums::Updates>>(5);
-        let m = Arc::new(RwLock::new(mtp));
+        let m: Arc<RwLock<Box<dyn Mtp + Send + Sync + 'static>>> =
+            Arc::new(RwLock::new(Box::new(mtp)));
 
         let mut slf = Self {
             update_rx,
@@ -167,9 +164,15 @@ impl<M: Mtp + Send + Sync + 'static> Sender<M> {
             }
         }
     }
+
     pub async fn step(&mut self) -> Result<Vec<tl::enums::Updates>, ReadError> {
         self.update_rx.recv().await.map_err(|_| ReadError::RxClosed)
     }
+
+    pub fn auth_key(&self) -> [u8; 256] {
+        self.mtp.read().auth_key()
+    }
+
     /*    /// Step network events, writing and reading at the same time.
     ///
     /// Updates received during this step, if any, are returned.
@@ -420,12 +423,12 @@ impl<M: Mtp + Send + Sync + 'static> Sender<M> {
 /// Handle `n` more read bytes being ready to process by the transport.
 ///
 /// This won't cause `ReadError::Io`, but yet another enum would be overkill.
-fn on_net_read<T: Transport, M: Mtp>(
+fn on_net_read<T: Transport>(
     requests: Requests,
     read_tail: &mut usize,
     read_buffer: &mut Vec<u8>,
     t: &T,
-    m: Arc<RwLock<M>>,
+    m: Arc<RwLock<Box<dyn Mtp + Send + Sync + 'static>>>,
     n: usize,
 ) -> Result<Vec<tl::enums::Updates>, ReadError> {
     if n == 0 {
@@ -465,17 +468,11 @@ fn on_net_read<T: Transport, M: Mtp>(
     Ok(updates)
 }
 
-impl Sender<mtp::Encrypted> {
-    pub fn auth_key(&self) -> [u8; 256] {
-        self.mtp.read().auth_key()
-    }
-}
-
 pub async fn connect<T: Transport + Send + Sync + 'static>(
     transport: T,
     addr: ServerAddr,
     rc_policy: &'static dyn ReconnectionPolicy,
-) -> Result<(Sender<mtp::Encrypted>, Enqueuer), AuthorizationError> {
+) -> Result<(Sender, Enqueuer), AuthorizationError> {
     let (sender, enqueuer) = Sender::connect(transport, mtp::Plain::new(), addr, rc_policy).await?;
     generate_auth_key::<T>(sender, enqueuer).await
 }
@@ -485,7 +482,7 @@ pub async fn connect_with_auth<T: Transport + Send + Sync + 'static>(
     addr: ServerAddr,
     auth_key: [u8; 256],
     rc_policy: &'static dyn ReconnectionPolicy,
-) -> Result<(Sender<mtp::Encrypted>, Enqueuer), Error> {
+) -> Result<(Sender, Enqueuer), Error> {
     Sender::connect(
         transport,
         mtp::Encrypted::build().finish(auth_key),
@@ -496,9 +493,9 @@ pub async fn connect_with_auth<T: Transport + Send + Sync + 'static>(
 }
 
 async fn generate_auth_key<T: Transport + Send + Sync + 'static>(
-    mut sender: Sender<mtp::Plain>,
+    mut sender: Sender,
     enqueuer: Enqueuer,
-) -> Result<(Sender<mtp::Encrypted>, Enqueuer), AuthorizationError> {
+) -> Result<(Sender, Enqueuer), AuthorizationError> {
     info!("generating new authorization key...");
     let (request, data) = authentication::step1()?;
     debug!("gen auth key: sending step 1");
@@ -521,12 +518,12 @@ async fn generate_auth_key<T: Transport + Send + Sync + 'static>(
 
     Ok((
         Sender {
-            mtp: Arc::new(RwLock::new(
+            mtp: Arc::new(RwLock::new(Box::new(
                 mtp::Encrypted::build()
                     .time_offset(time_offset)
                     .first_salt(first_salt)
                     .finish(auth_key),
-            )),
+            ))),
             /*next_ping: Instant::now() + PING_DELAY,
             stream: sender.stream,
             transport: sender.transport,

@@ -113,6 +113,9 @@ impl Mtp for Plain {
     }
 
     fn reset(&mut self) {}
+    fn auth_key(&self) -> [u8; 256] {
+        panic!("plain mtp doesnt have auth key")
+    }
 }
 
 #[cfg(test)]

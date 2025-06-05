@@ -1306,6 +1306,9 @@ impl Mtp for Encrypted {
         self.msg_count = 0;
         self.salt_request_msg_id = None;
     }
+    fn auth_key(&self) -> [u8; 256] {
+        self.auth_key.to_bytes()
+    }
 }
 
 #[cfg(test)]

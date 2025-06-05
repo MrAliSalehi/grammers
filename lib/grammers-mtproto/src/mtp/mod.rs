@@ -208,4 +208,7 @@ pub trait Mtp {
 
     /// Reset the state, as if a new instance was just created.
     fn reset(&mut self);
+    
+    ///panic on Plain Mtp
+    fn auth_key(&self) -> [u8; 256];
 }
