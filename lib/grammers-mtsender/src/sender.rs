@@ -1,5 +1,5 @@
 use crate::net::network_reader::NetworkReader;
-use crate::process_mtp::process_mtp_buffer;
+use crate::net::network_writer::NetworkWriter;
 pub use crate::{
     LEADING_BUFFER_SPACE, MAXIMUM_DATA, MsgIdPair, NO_PING_DISCONNECT, PING_DELAY, Request,
     RequestState,
@@ -13,20 +13,15 @@ use grammers_crypto::DequeBuffer;
 use grammers_mtproto::{
     authentication,
     mtp::{self, Mtp},
-    transport::{self, Transport},
+    transport::Transport,
 };
 use grammers_tl_types::{self as tl, RemoteCall};
-use log::{debug, error, info, trace, warn};
+use log::{debug, info};
 use parking_lot::{Mutex, RwLock};
-use std::ops::ControlFlow;
-use std::{io, io::Error, sync::Arc};
+use std::{io::Error, sync::Arc};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
-use tokio::{
-    io::AsyncReadExt,
-    sync::{mpsc, oneshot, oneshot::error::TryRecvError},
-};
+use tokio::sync::{mpsc, oneshot, oneshot::error::TryRecvError};
 
 pub type Requests = Arc<Mutex<Vec<Request>>>;
 
@@ -34,9 +29,6 @@ pub type Requests = Arc<Mutex<Vec<Request>>>;
 pub struct Sender {
     mtp: Arc<RwLock<Box<dyn Mtp>>>,
     requests: Vec<Request>,
-    request_rx: mpsc::UnboundedReceiver<Request>,
-    write_buffer: DequeBuffer<u8>,
-    write_head: usize,
     update_rx: broadcast::Receiver<Vec<tl::enums::Updates>>,
 }
 
@@ -49,7 +41,7 @@ impl Sender {
     ) -> Result<(Self, Enqueuer), Error> {
         let stream = NetStream::connect(&addr).await?;
         let (reader, write) = stream.into_split();
-        let (tx, rx) = mpsc::unbounded_channel::<Request>();
+        let (request_tx, request_rx) = mpsc::unbounded_channel::<Request>();
 
         let (update_tx, update_rx) = broadcast::channel::<Vec<tl::enums::Updates>>(5);
 
@@ -61,7 +53,7 @@ impl Sender {
 
         let requests = Arc::new(Mutex::new(Vec::<Request>::new()));
 
-        let nw_reader = NetworkReader::spawn_new(
+        let nw_reader = NetworkReader::new(
             transport.clone(),
             m.clone(),
             requests.clone(),
@@ -72,15 +64,19 @@ impl Sender {
             connection_tx,
         );
 
+        let read_handle = nw_reader.spawn();
+
+        let nw_writer =
+            NetworkWriter::new(transport, m.clone(), requests, request_rx, connection_rx);
+
+        let write_handle = nw_writer.spawn();
+
         let slf = Self {
             update_rx,
             mtp: m.clone(),
             requests: vec![],
-            request_rx: rx,
-            write_buffer: DequeBuffer::with_capacity(MAXIMUM_DATA, LEADING_BUFFER_SPACE),
-            write_head: 0,
         };
-        Ok((slf, Enqueuer(tx)))
+        Ok((slf, Enqueuer(request_tx)))
     }
 
     pub async fn invoke<R: RemoteCall>(&mut self, request: &R) -> Result<Vec<u8>, InvocationError> {
@@ -204,54 +200,7 @@ impl Sender {
       #[allow(unused_variables)]
 
 
-      /// Setup the write buffer for the transport, unless a write is already pending.
-      fn try_fill_write(&mut self) {
-          if !self.write_buffer.is_empty() {
-              return;
-          }
 
-          // TODO add a test to make sure we only ever send the same request once
-          for request in self
-              .requests
-              .iter_mut()
-              .filter(|r| matches!(r.state, RequestState::NotSerialized))
-          {
-              // TODO make mtp itself use BytesMut to avoid copies
-              if let Some(msg_id) = self.mtp.push(&mut self.write_buffer, &request.body) {
-                  assert!(request.body.len() >= 4);
-                  let req_id = u32::from_le_bytes([
-                      request.body[0],
-                      request.body[1],
-                      request.body[2],
-                      request.body[3],
-                  ]);
-                  debug!(
-                      "serialized request {:x} ({}) with {:?}",
-                      req_id,
-                      tl::name_for_id(req_id),
-                      msg_id
-                  );
-                  // Note how only NotSerialized become Serialized.
-                  // Nasty bugs that take ~2h to find occur otherwise!
-                  // (e.g. infinite loops leading to transport flood.)
-                  request.state = RequestState::Serialized(MsgIdPair::new(msg_id));
-              } else {
-                  break;
-              }
-          }
-
-          if let Some(container_msg_id) = self.mtp.finalize(&mut self.write_buffer) {
-              for request in self.requests.iter_mut() {
-                  match request.state {
-                      RequestState::Serialized(ref mut pair) => {
-                          pair.container_msg_id = container_msg_id;
-                      }
-                      RequestState::NotSerialized | RequestState::Sent(..) => {}
-                  }
-              }
-              self.transport.pack(&mut self.write_buffer)
-          }
-      }
 
       /// Handle `n` more written bytes being ready to process by the transport.
       fn on_net_write(&mut self, n: usize) {
@@ -299,6 +248,53 @@ impl Sender {
     */
 }
 
+/// Setup the write buffer for the transport, unless a write is already pending.
+/*fn try_fill_write() {
+    if !self.write_buffer.is_empty() {
+        return;
+    }
+
+    // TODO add a test to make sure we only ever send the same request once
+    for request in self
+        .requests
+        .iter_mut()
+        .filter(|r| matches!(r.state, RequestState::NotSerialized))
+    {
+        // TODO make mtp itself use BytesMut to avoid copies
+        if let Some(msg_id) = self.mtp.push(&mut self.write_buffer, &request.body) {
+            assert!(request.body.len() >= 4);
+            let req_id = u32::from_le_bytes([
+                request.body[0],
+                request.body[1],
+                request.body[2],
+                request.body[3],
+            ]);
+            debug!(
+                "serialized request {req_id:x} ({}) with {msg_id:?}",
+                tl::name_for_id(req_id)
+            );
+            // Note how only NotSerialized become Serialized.
+            // Nasty bugs that take ~2h to find occur otherwise!
+            // (e.g. infinite loops leading to transport flood.)
+            request.state = RequestState::Serialized(MsgIdPair::new(msg_id));
+        } else {
+            break;
+        }
+    }
+
+    if let Some(container_msg_id) = self.mtp.finalize(&mut self.write_buffer) {
+        for request in self.requests.iter_mut() {
+            match request.state {
+                RequestState::Serialized(ref mut pair) => {
+                    pair.container_msg_id = container_msg_id;
+                }
+                RequestState::NotSerialized | RequestState::Sent(..) => {}
+            }
+        }
+        self.transport.pack(&mut self.write_buffer)
+    }
+}
+*/
 //todo on_error for writer task
 /// Handle errors that occured while performing I/O.
 /*async fn on_error<T: Transport>(
@@ -419,9 +415,6 @@ async fn generate_auth_key<T: Transport>(
             ))),
             update_rx: sender.update_rx,
             requests: sender.requests,
-            request_rx: sender.request_rx,
-            write_buffer: sender.write_buffer,
-            write_head: sender.write_head,
         },
         enqueuer,
     ))

@@ -35,7 +35,6 @@ pub struct NetworkReaderInner<T: Transport> {
     transport: T,
     read_tail: AtomicUsize,
     read_buffer: Mutex<Vec<u8>>,
-    handle: parking_lot::Mutex<Option<JoinHandle<()>>>,
     update_tx: Sender<Vec<Updates>>,
     addr: ServerAddr,
     rp: &'static dyn ReconnectionPolicy,
@@ -44,7 +43,7 @@ pub struct NetworkReaderInner<T: Transport> {
 }
 
 impl<T: Transport> NetworkReader<T> {
-    pub fn spawn_new(
+    pub fn new(
         t: T,
         m: Arc<RwLock<Box<dyn Mtp>>>,
         requests: Requests,
@@ -54,14 +53,11 @@ impl<T: Transport> NetworkReader<T> {
         rp: &'static dyn ReconnectionPolicy,
         connection_tx: Sender<Arc<OwnedWriteHalf>>,
     ) -> Self {
-        let read_tail = AtomicUsize::new(0);
-        let read_buffer = Mutex::new(vec![0; MAXIMUM_DATA]);
-
-        let slf = Self {
+        Self {
             inner: Arc::new(NetworkReaderInner {
                 reader: Mutex::new(reader),
-                read_tail,
-                read_buffer,
+                read_tail: AtomicUsize::new(0),
+                read_buffer: Mutex::new(vec![0; MAXIMUM_DATA]),
                 requests,
                 m,
                 rp,
@@ -69,22 +65,20 @@ impl<T: Transport> NetworkReader<T> {
                 update_tx,
                 connection_tx,
                 transport: t,
-                handle: parking_lot::Mutex::new(None),
             }),
-        };
-        let slf_cl = slf.clone();
-        let read_handle = tokio::spawn(async move {
+        }
+    }
+
+    pub fn spawn(&self) -> JoinHandle<()> {
+        let slf_cl = self.clone();
+        tokio::spawn(async move {
             loop {
                 _ = slf_cl
                     .step_network()
                     .await
                     .inspect_err(|e| error!("network_reader failed: {e}"));
             }
-        });
-
-        *slf.handle.lock() = Some(read_handle);
-
-        todo!()
+        })
     }
 
     async fn step_network(&self) -> Result<(), ReadError> {
@@ -251,14 +245,5 @@ impl<T: Transport> Deref for NetworkReader<T> {
     type Target = NetworkReaderInner<T>;
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl<T: Transport> Drop for NetworkReaderInner<T> {
-    fn drop(&mut self) {
-        if let Some(h) = self.handle.lock().as_ref() {
-            h.abort();
-            info!("network reader dropped.");
-        }
     }
 }

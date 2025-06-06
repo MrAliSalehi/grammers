@@ -7,6 +7,7 @@
 // except according to those terms.
 
 pub mod network_reader;
+pub mod network_writer;
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod tcp;
