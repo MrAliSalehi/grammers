@@ -253,3 +253,12 @@ impl<T: Transport> Deref for NetworkReader<T> {
         &self.inner
     }
 }
+
+impl<T: Transport> Drop for NetworkReaderInner<T> {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.lock().as_ref() {
+            h.abort();
+            info!("network reader dropped.");
+        }
+    }
+}
