@@ -129,7 +129,7 @@ impl Sender {
         }
     }
 
-    pub async fn step(&mut self) -> Result<Vec<tl::enums::Updates>, ReadError> {
+    pub async fn next_updates(&mut self) -> Result<Vec<tl::enums::Updates>, ReadError> {
         self.update_rx.recv().await.map_err(|_| ReadError::RxClosed)
     }
 

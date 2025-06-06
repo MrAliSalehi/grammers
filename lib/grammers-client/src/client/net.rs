@@ -381,18 +381,18 @@ impl Client {
     /// # async fn f(client: grammers_client::Client) -> Result<(), Box<dyn std::error::Error>> {
     /// loop {
     ///     // Process network events forever until we gracefully disconnect or get an error.
-    ///     client.step().await?;
+    ///     client.block_on_updates().await?;
     /// }
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn step(&self) -> Result<(), sender::ReadError> {
-        let updates = self.0.conn.step().await?;
+    pub async fn block_on_updates(&self) -> Result<(), sender::ReadError> {
+        let updates = self.0.conn.block_on_updates().await?;
         self.process_socket_updates(updates);
         Ok(())
     }
 
-    /// Run the client by repeatedly calling [`Client::step`] until a graceful disconnection
+    /// Run the client by repeatedly calling [`Client::block_on_updates`] until a graceful disconnection
     /// occurs, or a network error occurs. Incoming updates are ignored and simply dropped.
     /// instead.
     ///
@@ -407,7 +407,7 @@ impl Client {
     pub async fn run_until_disconnected(self) -> Result<(), sender::ReadError> {
         loop {
             // TODO review doc comments regarding disconnects
-            self.step().await?;
+            self.block_on_updates().await?;
         }
     }
 }
@@ -455,7 +455,8 @@ impl Connection {
                     Err(e) => break Err(e),
                 },
                 Err(TryRecvError::Empty) => {
-                    on_updates(self.step().await?);
+                    //todo what to do instead of step?
+                    //on_updates(self.step().await?);
                 }
                 Err(TryRecvError::Closed) => {
                     panic!("request channel dropped before receiving a result")
@@ -464,7 +465,7 @@ impl Connection {
         }
     }
 
-    async fn step(&self) -> Result<Vec<tl::enums::Updates>, sender::ReadError> {
+    async fn block_on_updates(&self) -> Result<Vec<tl::enums::Updates>, sender::ReadError> {
         let ticket_number = self.step_counter.load(Ordering::SeqCst);
         let mut sender = self.sender.lock().await;
         match self.step_counter.compare_exchange(
@@ -474,7 +475,7 @@ impl Connection {
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            Ok(_) => sender.step().await, // We're the one to drive IO.
+            Ok(_) => sender.next_updates().await, // We're the one to drive IO.
             Err(_) => Ok(Vec::new()),     // A different task drove IO.
         }
     }

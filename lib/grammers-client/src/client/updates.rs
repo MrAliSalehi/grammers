@@ -180,7 +180,7 @@ impl Client {
             }
 
             let sleep = pin!(async { sleep_until(deadline).await });
-            let step = pin!(async { self.step().await });
+            let step = pin!(async { self.block_on_updates().await });
 
             match select(sleep, step).await {
                 Either::Left(_) => {}
