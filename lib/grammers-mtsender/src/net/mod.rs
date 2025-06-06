@@ -6,6 +6,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+pub mod network_reader;
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod tcp;
 
