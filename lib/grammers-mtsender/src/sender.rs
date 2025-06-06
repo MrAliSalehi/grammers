@@ -29,7 +29,7 @@ pub type Requests = Arc<Mutex<Vec<Request>>>;
 
 /// Manages enqueuing requests, matching them to their response, and IO.
 pub struct Sender {
-    mtp: Arc<RwLock<Box<dyn Mtp + Send + Sync>>>,
+    mtp: Arc<RwLock<Box<dyn Mtp>>>,
     addr: ServerAddr,
     requests: Vec<Request>,
     request_rx: mpsc::UnboundedReceiver<Request>,
@@ -47,7 +47,7 @@ pub struct Sender {
 }
 
 impl Sender {
-    async fn connect<T: Transport + Send + Sync + 'static, M: Mtp + Send + Sync + 'static>(
+    async fn connect<T: Transport, M: Mtp>(
         transport: T,
         mtp: M,
         addr: ServerAddr,
@@ -58,7 +58,7 @@ impl Sender {
         let (tx, rx) = mpsc::unbounded_channel::<Request>();
 
         let (update_tx, update_rx) = broadcast::channel::<Vec<tl::enums::Updates>>(5);
-        let m: Arc<RwLock<Box<dyn Mtp + Send + Sync + 'static>>> =
+        let m: Arc<RwLock<Box<dyn Mtp>>> =
             Arc::new(RwLock::new(Box::new(mtp)));
 
         let mut slf = Self {
@@ -428,7 +428,7 @@ fn on_net_read<T: Transport>(
     read_tail: &mut usize,
     read_buffer: &mut Vec<u8>,
     t: &T,
-    m: Arc<RwLock<Box<dyn Mtp + Send + Sync + 'static>>>,
+    m: Arc<RwLock<Box<dyn Mtp>>>,
     n: usize,
 ) -> Result<Vec<tl::enums::Updates>, ReadError> {
     if n == 0 {
@@ -468,7 +468,7 @@ fn on_net_read<T: Transport>(
     Ok(updates)
 }
 
-pub async fn connect<T: Transport + Send + Sync + 'static>(
+pub async fn connect<T: Transport>(
     transport: T,
     addr: ServerAddr,
     rc_policy: &'static dyn ReconnectionPolicy,
@@ -477,7 +477,7 @@ pub async fn connect<T: Transport + Send + Sync + 'static>(
     generate_auth_key::<T>(sender, enqueuer).await
 }
 
-pub async fn connect_with_auth<T: Transport + Send + Sync + 'static>(
+pub async fn connect_with_auth<T: Transport>(
     transport: T,
     addr: ServerAddr,
     auth_key: [u8; 256],
@@ -492,7 +492,7 @@ pub async fn connect_with_auth<T: Transport + Send + Sync + 'static>(
     .await
 }
 
-async fn generate_auth_key<T: Transport + Send + Sync + 'static>(
+async fn generate_auth_key<T: Transport>(
     mut sender: Sender,
     enqueuer: Enqueuer,
 ) -> Result<(Sender, Enqueuer), AuthorizationError> {

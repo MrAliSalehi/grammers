@@ -169,7 +169,7 @@ impl From<crypto::Error> for DeserializeError {
 /// messages and deserialize incoming ones into proper responses.
 ///
 /// [Mobile Transport Protocol]: https://core.telegram.org/mtproto/description
-pub trait Mtp {
+pub trait Mtp: Send + Sync + 'static {
     /// Serializes one request to the input buffer.
     /// The same buffer should be used until `finalize` is called.
     ///
@@ -208,7 +208,7 @@ pub trait Mtp {
 
     /// Reset the state, as if a new instance was just created.
     fn reset(&mut self);
-    
+
     ///panic on Plain Mtp
     fn auth_key(&self) -> [u8; 256];
 }
