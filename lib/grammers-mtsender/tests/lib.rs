@@ -13,7 +13,7 @@ pub const TELEGRAM_DEFAULT_TEST_DC: &str = TELEGRAM_TEST_DC_2;
 
 use grammers_mtproto::transport;
 use grammers_mtsender::NoReconnect;
-use grammers_tl_types::{Deserializable, LAYER, RemoteCall, enums, functions};
+use grammers_tl_types::{Deserializable, LAYER, RemoteCall, Serializable, enums, functions};
 use std::str::FromStr;
 
 use grammers_mtsender::sender::connect;
@@ -32,7 +32,7 @@ fn test_invoke_encrypted_method() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let (mut sender, enqueuer) = connect(
+        let sender = connect(
             transport::Full::new(),
             grammers_mtsender::ServerAddr::Tcp {
                 address: std::net::SocketAddr::from_str(TELEGRAM_TEST_DC_2).unwrap(),
@@ -42,7 +42,7 @@ fn test_invoke_encrypted_method() {
         .await
         .unwrap();
 
-        let mut rx = enqueuer.enqueue(&functions::InvokeWithLayer {
+        let mut rx = sender.enqueue(&functions::InvokeWithLayer {
             layer: LAYER,
             query: functions::InitConnection {
                 api_id: 1,
@@ -58,7 +58,6 @@ fn test_invoke_encrypted_method() {
             },
         });
         loop {
-            //sender.step().await.unwrap();
             if let Ok(response) = rx.try_recv() {
                 match response {
                     Ok(body) => {

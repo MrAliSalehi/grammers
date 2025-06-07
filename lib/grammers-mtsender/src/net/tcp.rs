@@ -10,7 +10,6 @@ use super::ServerAddr;
 use log::info;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-pub use tokio::net::tcp::{ReadHalf, WriteHalf};
 
 pub enum NetStream {
     Tcp(TcpStream),
@@ -24,14 +23,6 @@ impl NetStream {
             Self::Tcp(stream) => stream.into_split(),
             #[cfg(feature = "proxy")]
             Self::ProxySocks5(stream) => stream.into_split(),
-        }
-    }
-
-    pub(crate) fn split(&mut self) -> (ReadHalf, WriteHalf) {
-        match self {
-            Self::Tcp(stream) => stream.split(),
-            #[cfg(feature = "proxy")]
-            Self::ProxySocks5(stream) => stream.split(),
         }
     }
 

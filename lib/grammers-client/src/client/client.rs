@@ -5,9 +5,7 @@
 // <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
-use super::net;
-use grammers_mtproto::mtp;
-use grammers_mtsender::enqueuer::Enqueuer;
+
 use grammers_mtsender::sender::Sender;
 use grammers_mtsender::{ReconnectionPolicy, ServerAddr};
 use grammers_session::{ChatHashCache, MessageBoxes, Session, State};
@@ -140,7 +138,6 @@ pub(crate) struct ClientState {
 
 pub(crate) struct Connection {
     pub(crate) sender: AsyncMutex<Sender>,
-    pub(crate) request_tx: RwLock<Enqueuer>,
     pub(crate) step_counter: AtomicU32,
 }
 

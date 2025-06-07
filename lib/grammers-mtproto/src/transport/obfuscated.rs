@@ -1,4 +1,3 @@
-use std::ops::Deref;
 use std::sync::Arc;
 // Copyright 2020 - developers of the `grammers` project.
 //

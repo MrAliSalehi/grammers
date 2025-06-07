@@ -10,41 +10,34 @@ use grammers_mtproto::transport::Transport;
 use grammers_tl_types as tl;
 use grammers_tl_types::enums::Updates;
 use log::{debug, error, info, trace, warn};
-use parking_lot::RwLock;
 use std::io;
 use std::io::Error;
-use std::ops::{ControlFlow, Deref};
+use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::broadcast::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-#[derive(Clone)]
-pub struct NetworkReader<T: Transport> {
-    inner: Arc<NetworkReaderInner<T>>,
-}
-
-pub struct NetworkReaderInner<T: Transport> {
+pub struct NetworkReader {
     requests: Requests,
     m: Arc<RwLock<Box<dyn Mtp>>>,
-    transport: T,
-    read_tail: AtomicUsize,
-    read_buffer: Mutex<Vec<u8>>,
+    transport: Arc<Box<dyn Transport>>,
+    read_tail: usize,
+    read_buffer: Vec<u8>,
     update_tx: Sender<Vec<Updates>>,
     addr: ServerAddr,
     rp: &'static dyn ReconnectionPolicy,
     connection_tx: Sender<Arc<OwnedWriteHalf>>,
-    reader: Mutex<OwnedReadHalf>,
+    reader: OwnedReadHalf,
 }
 
-impl<T: Transport> NetworkReader<T> {
+impl NetworkReader {
     pub fn new(
-        t: T,
+        t: Arc<Box<dyn Transport>>,
         m: Arc<RwLock<Box<dyn Mtp>>>,
         requests: Requests,
         reader: OwnedReadHalf,
@@ -54,26 +47,23 @@ impl<T: Transport> NetworkReader<T> {
         connection_tx: Sender<Arc<OwnedWriteHalf>>,
     ) -> Self {
         Self {
-            inner: Arc::new(NetworkReaderInner {
-                reader: Mutex::new(reader),
-                read_tail: AtomicUsize::new(0),
-                read_buffer: Mutex::new(vec![0; MAXIMUM_DATA]),
-                requests,
-                m,
-                rp,
-                addr,
-                update_tx,
-                connection_tx,
-                transport: t,
-            }),
+            reader,
+            read_tail: 0,
+            read_buffer: vec![0; MAXIMUM_DATA],
+            requests,
+            m,
+            rp,
+            addr,
+            update_tx,
+            connection_tx,
+            transport: t,
         }
     }
 
-    pub fn spawn(&self) -> JoinHandle<()> {
-        let slf_cl = self.clone();
+    pub fn spawn(mut self) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                _ = slf_cl
+                _ = self
                     .step_network()
                     .await
                     .inspect_err(|e| error!("network_reader failed: {e}"));
@@ -81,18 +71,13 @@ impl<T: Transport> NetworkReader<T> {
         })
     }
 
-    async fn step_network(&self) -> Result<(), ReadError> {
-        let mut read_buffer = self.read_buffer.lock().await;
-        let read_tail = self.read_tail.load(Ordering::Relaxed);
-
+    async fn step_network(&mut self) -> Result<(), ReadError> {
         let n = self
             .reader
-            .lock()
-            .await
-            .read(&mut read_buffer[read_tail..])
+            .read(&mut self.read_buffer[self.read_tail..])
             .await?;
 
-        let updates = match self.on_net_read(&mut read_buffer, n) {
+        let updates = match self.on_net_read(n).await {
             Ok(u) => u,
             Err(e) => self.on_error(e).await?,
         };
@@ -105,11 +90,7 @@ impl<T: Transport> NetworkReader<T> {
     /// Handle `n` more read bytes being ready to process by the transport.
     ///
     /// This won't cause `ReadError::Io`, but yet another enum would be overkill.
-    fn on_net_read(
-        &self,
-        read_buffer: &mut Vec<u8>,
-        n: usize,
-    ) -> Result<Vec<tl::enums::Updates>, ReadError> {
+    async fn on_net_read(&mut self, n: usize) -> Result<Vec<tl::enums::Updates>, ReadError> {
         if n == 0 {
             return Err(ReadError::Io(Error::new(
                 io::ErrorKind::ConnectionReset,
@@ -117,57 +98,54 @@ impl<T: Transport> NetworkReader<T> {
             )));
         }
 
-        // *read_tail += n;
-        //fetch_add returns the old value, later we need the new value so +n is added again
-        let read_tail = self.read_tail.fetch_add(n, Ordering::Relaxed) + n;
+        self.read_tail += n;
 
-        trace!("read {} bytes from the network", n);
-        trace!("trying to unpack buffer of {} bytes...", read_tail);
+        trace!("read {n} bytes from the network");
+        trace!("trying to unpack buffer of {} bytes...", self.read_tail);
 
         // TODO the buffer might have multiple transport packets, what should happen with the
         // updates successfully read if subsequent packets fail to be deserialized properly?
         let mut updates = Vec::new();
         let mut next_offset = 0;
-        while next_offset != read_tail {
+        let mut mtp = self.m.write().await;
+        while next_offset != self.read_tail {
             match self
                 .transport
-                .unpack(&mut read_buffer[next_offset..read_tail])
+                .unpack(&mut self.read_buffer[next_offset..self.read_tail])
             {
                 Ok(offset) => {
                     debug!("deserializing valid transport packet...");
-                    let result = self.m.write().deserialize(
-                        &read_buffer[next_offset..][offset.data_start..offset.data_end],
+                    let result = mtp.deserialize(
+                        &self.read_buffer[next_offset..][offset.data_start..offset.data_end],
                     )?;
 
-                    process_mtp_buffer(result, &mut updates, self.requests.clone());
+                    process_mtp_buffer(result, &mut updates, self.requests.clone()).await;
                     next_offset += offset.next_offset;
                 }
                 Err(transport::Error::MissingBytes) => break,
                 Err(err) => return Err(err.into()),
             }
         }
+        drop(mtp);
 
-        read_buffer.copy_within(next_offset..read_tail, 0);
-        //*read_tail -= next_offset;
-        self.read_tail.fetch_sub(next_offset, Ordering::Relaxed);
+        self.read_buffer.copy_within(next_offset..self.read_tail, 0);
+        self.read_tail -= next_offset;
 
         Ok(updates)
     }
 
     /// Handle errors that occurred while performing I/O.
-    async fn on_error(&self, error: ReadError) -> Result<Vec<Updates>, ReadError> {
+    async fn on_error(&mut self, error: ReadError) -> Result<Vec<Updates>, ReadError> {
         info!("handling error: {error}");
         self.transport.reset();
-        self.m.write().reset();
-        let mut read_buffer = self.read_buffer.lock().await;
+        self.m.write().await.reset();
         info!(
             "resetting sender state from read_buffer {}/{}",
-            self.read_tail.load(Ordering::Relaxed),
-            read_buffer.len(),
+            self.read_tail,
+            self.read_buffer.len(),
         );
-        self.read_tail.store(0, Ordering::Relaxed);
-        read_buffer.fill(0);
-        drop(read_buffer);
+        self.read_tail = 0;
+        self.read_buffer.fill(0);
 
         let error = match error {
             ReadError::Io(_) if matches!(self.rp.should_retry(0), ControlFlow::Continue(_)) => {
@@ -176,6 +154,7 @@ impl<T: Transport> NetworkReader<T> {
                         // Reconnect success means everything can be retried.
                         self.requests
                             .lock()
+                            .await
                             .iter_mut()
                             .for_each(|r| r.state = RequestState::NotSerialized);
 
@@ -190,7 +169,7 @@ impl<T: Transport> NetworkReader<T> {
             e => e,
         };
 
-        let mut requests = self.requests.lock();
+        let mut requests = self.requests.lock().await;
         warn!(
             "marking all {} request(s) as failed: {}",
             requests.len(),
@@ -204,7 +183,7 @@ impl<T: Transport> NetworkReader<T> {
         Err(error)
     }
 
-    async fn try_connect(&self) -> Result<(), Error> {
+    async fn try_connect(&mut self) -> Result<(), Error> {
         let mut attempts = 0;
         loop {
             match NetStream::connect(&self.addr).await.map(|e| e.into_split()) {
@@ -213,7 +192,7 @@ impl<T: Transport> NetworkReader<T> {
                         "auto-reconnect success after {} failed attempt(s)",
                         attempts
                     );
-                    *self.reader.lock().await = read;
+                    self.reader = read;
                     //send the writer half of stream to the writer task
                     self.connection_tx.send(Arc::new(write)).unwrap();
                     return Ok(());
@@ -238,12 +217,5 @@ impl<T: Transport> NetworkReader<T> {
                 }
             }
         }
-    }
-}
-
-impl<T: Transport> Deref for NetworkReader<T> {
-    type Target = NetworkReaderInner<T>;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
     }
 }

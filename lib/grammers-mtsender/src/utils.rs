@@ -6,8 +6,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use parking_lot::{Condvar, Mutex};
-use std::collections::VecDeque;
 use std::time::Duration;
 use web_time::Instant;
 

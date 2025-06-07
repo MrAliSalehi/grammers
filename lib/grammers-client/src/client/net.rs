@@ -8,10 +8,8 @@
 use super::client::{ClientState, Connection};
 use super::{Client, ClientInner, Config};
 use crate::utils;
-use grammers_mtproto::mtp;
 use grammers_mtproto::transport;
 use grammers_mtsender::ServerAddr;
-use grammers_mtsender::enqueuer::Enqueuer;
 use grammers_mtsender::sender::Sender;
 use grammers_mtsender::{AuthorizationError, InvocationError, RpcError, sender, utils::sleep};
 use grammers_session::{ChatHashCache, MessageBoxes};
@@ -54,9 +52,6 @@ const WS_ADDRESSES: [&str; 6] = [
     "wss://flora.web.telegram.org/apiws",
 ];
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) type Transport = transport::Full;
-
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub(crate) type Transport = transport::Obfuscated<transport::Intermediate>;
 
@@ -65,7 +60,7 @@ const DEFAULT_DC: i32 = 2;
 pub(crate) async fn connect_sender(
     dc_id: i32,
     config: &Config,
-) -> Result<(Sender, Enqueuer), AuthorizationError> {
+) -> Result<Sender, AuthorizationError> {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     let transport = transport::Full::new();
 
@@ -103,7 +98,7 @@ pub(crate) async fn connect_sender(
         addr
     };
 
-    let (mut sender, request_tx) = if let Some(auth_key) = config.session.dc_auth_key(dc_id) {
+    let sender = if let Some(auth_key) = config.session.dc_auth_key(dc_id) {
         info!(
             "creating a new sender with existing auth key to dc {} {:?}",
             dc_id, addr
@@ -117,7 +112,7 @@ pub(crate) async fn connect_sender(
             dc_id, addr
         );
 
-        let (sender, tx) =
+        let sender =
             sender::connect(transport, addr.clone(), config.params.reconnection_policy).await?;
 
         match addr {
@@ -125,7 +120,7 @@ pub(crate) async fn connect_sender(
             ServerAddr::Tcp { ref address, .. } => {
                 config
                     .session
-                    .insert_dc_tcp(dc_id, address, sender.auth_key());
+                    .insert_dc_tcp(dc_id, address, sender.auth_key().await);
             }
             #[cfg(all(
                 not(all(target_arch = "wasm32", target_os = "unknown")),
@@ -134,16 +129,16 @@ pub(crate) async fn connect_sender(
             ServerAddr::Proxied { ref address, .. } => {
                 config
                     .session
-                    .insert_dc_tcp(dc_id, address, sender.auth_key());
+                    .insert_dc_tcp(dc_id, address, sender.auth_key().await);
             }
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             ServerAddr::Ws { ref address } => {
                 config
                     .session
-                    .insert_dc_ws(dc_id, address, sender.auth_key());
+                    .insert_dc_ws(dc_id, address, sender.auth_key().await);
             }
         }
-        (sender, tx)
+        sender
     };
 
     // TODO handle -404 (we had a previously-valid authkey, but server no longer knows about it)
@@ -165,8 +160,8 @@ pub(crate) async fn connect_sender(
             },
         })
         .await?;
-
-    Ok((sender, request_tx))
+    info!("init connection done");
+    Ok(sender)
 }
 
 /// Method implementations directly related with network connectivity.
@@ -205,7 +200,7 @@ impl Client {
             .get_user()
             .map(|u| u.dc)
             .unwrap_or(DEFAULT_DC);
-        let (sender, request_tx) = connect_sender(dc_id, &config).await?;
+        let sender = connect_sender(dc_id, &config).await?;
         let message_box = if config.params.catch_up {
             if let Some(state) = config.session.get_state() {
                 MessageBoxes::load(state)
@@ -239,7 +234,7 @@ impl Client {
         let client = Self(Arc::new(ClientInner {
             id: utils::generate_random_id(),
             config,
-            conn: Connection::new(sender, request_tx),
+            conn: Connection::new(sender),
             state: RwLock::new(ClientState {
                 dc_id,
                 message_box,
@@ -324,8 +319,8 @@ impl Client {
         let mut mutex = self.0.downloader_map.write().await;
         debug!("Connecting new datacenter {}", dc_id);
         match connect_sender(dc_id, &self.0.config).await {
-            Ok((new_sender, new_tx)) => {
-                let new_downloader = Arc::new(Connection::new(new_sender, new_tx));
+            Ok(new_sender) => {
+                let new_downloader = Arc::new(Connection::new(new_sender));
 
                 // export auth
                 let authorization = self.export_authorization(dc_id).await?;
@@ -413,10 +408,9 @@ impl Client {
 }
 
 impl Connection {
-    fn new(sender: Sender, request_tx: Enqueuer) -> Self {
+    fn new(sender: Sender) -> Self {
         Self {
             sender: AsyncMutex::new(sender),
-            request_tx: RwLock::new(request_tx),
             step_counter: AtomicU32::new(0),
         }
     }
@@ -429,7 +423,7 @@ impl Connection {
     ) -> Result<R::Return, InvocationError> {
         let mut slept_flood = false;
 
-        let mut rx = { self.request_tx.read().unwrap().enqueue(request) };
+        let mut rx = { self.sender.lock().await.enqueue(request) };
         loop {
             match rx.try_recv() {
                 Ok(response) => match response {
@@ -449,15 +443,12 @@ impl Connection {
                         );
                         sleep(delay).await;
                         slept_flood = true;
-                        rx = self.request_tx.read().unwrap().enqueue(request);
+                        rx = self.sender.lock().await.enqueue(request);
                         continue;
                     }
                     Err(e) => break Err(e),
                 },
-                Err(TryRecvError::Empty) => {
-                    //todo what to do instead of step?
-                    //on_updates(self.step().await?);
-                }
+                Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Closed) => {
                     panic!("request channel dropped before receiving a result")
                 }
@@ -467,7 +458,6 @@ impl Connection {
 
     async fn block_on_updates(&self) -> Result<Vec<tl::enums::Updates>, sender::ReadError> {
         let ticket_number = self.step_counter.load(Ordering::SeqCst);
-        let mut sender = self.sender.lock().await;
         match self.step_counter.compare_exchange(
             ticket_number,
             // As long as the counter's modulo is larger than the amount of concurrent tasks, we're fine.
@@ -475,8 +465,8 @@ impl Connection {
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {
-            Ok(_) => sender.next_updates().await, // We're the one to drive IO.
-            Err(_) => Ok(Vec::new()),     // A different task drove IO.
+            Ok(_) => self.sender.lock().await.next_updates().await, // We're the one to drive IO.
+            Err(_) => Ok(Vec::new()),                               // A different task drove IO.
         }
     }
 }

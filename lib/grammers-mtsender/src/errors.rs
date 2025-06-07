@@ -11,6 +11,12 @@ use std::fmt;
 use std::io;
 
 #[derive(Debug)]
+pub enum WriteError {
+    BadWriter,
+    WriterNotReleased,
+}
+
+#[derive(Debug)]
 pub enum ReadError {
     Io(io::Error),
     Transport(transport::Error),

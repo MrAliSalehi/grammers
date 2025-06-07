@@ -86,7 +86,7 @@ impl fmt::Display for Error {
 }
 
 /// The trait used by the transports to create instances of themselves.
-pub trait Transport: Clone + Send + Sync + 'static {
+pub trait Transport: Send + Sync + 'static {
     /// Packs the input buffer in-place.
     ///
     /// Panics if `input.len()` is not divisible by 4.

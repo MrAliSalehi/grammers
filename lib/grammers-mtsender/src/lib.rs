@@ -8,7 +8,6 @@
 
 #![deny(unsafe_code)]
 
-pub mod enqueuer;
 mod errors;
 mod net;
 pub mod process_mtp;
@@ -23,12 +22,8 @@ use grammers_mtproto::{
     mtp::{self},
 };
 pub use net::ServerAddr;
-use std::{
-    sync::atomic::{AtomicI64, Ordering},
-    time::Duration,
-};
+use std::time::Duration;
 use tokio::sync::oneshot;
-use web_time::SystemTime;
 
 /// The maximum data that we're willing to send or receive at once.
 ///
@@ -59,24 +54,6 @@ pub const PING_DELAY: Duration = Duration::from_secs(60);
 /// are getting through consistently enough.
 pub const NO_PING_DISCONNECT: i32 = 75;
 
-/// Generate a "random" ping ID.
-pub(crate) fn generate_random_id() -> i64 {
-    static LAST_ID: AtomicI64 = AtomicI64::new(0);
-
-    if LAST_ID.load(Ordering::SeqCst) == 0 {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("system time is before epoch")
-            .as_nanos() as i64;
-
-        LAST_ID
-            .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
-            .unwrap();
-    }
-
-    LAST_ID.fetch_add(1, Ordering::SeqCst)
-}
-
 pub struct Request {
     body: Vec<u8>,
     state: RequestState,
@@ -89,6 +66,7 @@ pub struct MsgIdPair {
     container_msg_id: MsgId,
 }
 
+#[derive(Debug)]
 pub enum RequestState {
     NotSerialized,
     Serialized(MsgIdPair),

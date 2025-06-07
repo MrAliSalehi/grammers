@@ -7,23 +7,23 @@ use grammers_mtproto::mtp::{
 use grammers_tl_types as tl;
 use grammers_tl_types::Deserializable;
 use log::{debug, error, info, warn};
-use parking_lot::Mutex;
-use std::sync::Arc;
 
 /// Process the result of deserializing an MTP buffer.
-pub fn process_mtp_buffer(
+pub async fn process_mtp_buffer(
     results: Vec<Deserialization>,
     updates: &mut Vec<tl::enums::Updates>,
-    requests: Arc<Mutex<Vec<Request>>>,
+    requests: Requests,
 ) {
     for result in results {
         match result {
             Deserialization::Update(update) => process_update(updates, update),
-            Deserialization::RpcResult(result) => process_result(requests.clone(), result),
-            Deserialization::RpcError(error) => process_error(requests.clone(), error),
-            Deserialization::BadMessage(bad_msg) => process_bad_message(requests.clone(), bad_msg),
+            Deserialization::RpcResult(result) => process_result(requests.clone(), result).await,
+            Deserialization::RpcError(error) => process_error(requests.clone(), error).await,
+            Deserialization::BadMessage(bad_msg) => {
+                process_bad_message(requests.clone(), bad_msg).await
+            }
             Deserialization::Failure(failure) => {
-                process_deserialize_error(requests.clone(), failure)
+                process_deserialize_error(requests.clone(), failure).await
             }
         }
     }
@@ -70,8 +70,8 @@ fn process_update(updates: &mut Vec<tl::enums::Updates>, update: Vec<u8>) {
     }
 }
 
-fn process_result(requests: Requests, result: RpcResult) {
-    if let Some(req) = pop_request(requests, result.msg_id) {
+async fn process_result(requests: Requests, result: RpcResult) {
+    if let Some(req) = pop_request(requests, result.msg_id).await {
         let x = result.body;
         assert!(x.len() >= 4);
         let res_id = u32::from_le_bytes([x[0], x[1], x[2], x[3]]);
@@ -90,8 +90,8 @@ fn process_result(requests: Requests, result: RpcResult) {
     }
 }
 
-fn process_error(requests: Requests, error: RpcResultError) {
-    if let Some(req) = pop_request(requests, error.msg_id) {
+async fn process_error(requests: Requests, error: RpcResultError) {
+    if let Some(req) = pop_request(requests, error.msg_id).await {
         debug!("got rpc error {:?}", error.error);
         let x = req.body.as_slice();
         drop(
@@ -108,8 +108,8 @@ fn process_error(requests: Requests, error: RpcResultError) {
     }
 }
 
-fn process_bad_message(requests: Requests, bad_msg: BadMessage) {
-    let mut requests = requests.lock();
+async fn process_bad_message(requests: Requests, bad_msg: BadMessage) {
+    let mut requests = requests.lock().await;
     for i in (0..requests.len()).rev() {
         match &requests[i].state {
             RequestState::Serialized(pair)
@@ -157,8 +157,8 @@ fn process_bad_message(requests: Requests, bad_msg: BadMessage) {
     }
 }
 
-fn process_deserialize_error(requests: Requests, failure: DeserializationFailure) {
-    if let Some(req) = pop_request(requests, failure.msg_id) {
+async fn process_deserialize_error(requests: Requests, failure: DeserializationFailure) {
+    if let Some(req) = pop_request(requests, failure.msg_id).await {
         debug!("got deserialization failure {:?}", failure.error);
         drop(
             req.result
@@ -172,8 +172,8 @@ fn process_deserialize_error(requests: Requests, failure: DeserializationFailure
     }
 }
 
-fn pop_request(requests: Requests, msg_id: MsgId) -> Option<Request> {
-    let mut requests = requests.lock();
+async fn pop_request(requests: Requests, msg_id: MsgId) -> Option<Request> {
+    let mut requests = requests.lock().await;
     for i in 0..requests.len() {
         match &requests[i].state {
             RequestState::Serialized(pair) if pair.msg_id == msg_id => {
