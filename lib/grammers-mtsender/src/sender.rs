@@ -74,6 +74,7 @@ impl Sender {
             connection_rx,
             write,
             request_rx,
+            request_tx.clone(),
         )
         .spawn();
 

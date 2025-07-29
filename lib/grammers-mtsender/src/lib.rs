@@ -43,7 +43,7 @@ pub const LEADING_BUFFER_SPACE: usize = mtp::MAX_TRANSPORT_HEADER_LEN
     + mtp::MESSAGE_CONTAINER_HEADER_LEN;
 
 /// Every how often are pings sent?
-pub const PING_DELAY: Duration = Duration::from_secs(60);
+pub const PING_DELAY: Duration = Duration::from_secs(20);
 
 /// After how many seconds should the server close the connection when we send a ping?
 ///

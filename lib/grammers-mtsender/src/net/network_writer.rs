@@ -1,19 +1,24 @@
 use crate::errors::WriteError;
 use crate::sender::Requests;
-use crate::{LEADING_BUFFER_SPACE, MAXIMUM_DATA, MsgIdPair, ReadError, Request, RequestState};
+use crate::{
+    LEADING_BUFFER_SPACE, MAXIMUM_DATA, MsgIdPair, NO_PING_DISCONNECT, PING_DELAY, ReadError,
+    Request, RequestState,
+};
 use grammers_crypto::DequeBuffer;
 use grammers_mtproto::mtp::Mtp;
 use grammers_mtproto::transport::Transport;
 use grammers_tl_types as tl;
+use grammers_tl_types::Serializable;
 use log::{debug, error, info, trace};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::RwLock;
 use tokio::sync::broadcast::Receiver;
-use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -25,7 +30,9 @@ pub struct NetworkWriter {
     write_buffer: DequeBuffer<u8>,
     connection_rx: Receiver<Arc<OwnedWriteHalf>>,
     writer: OwnedWriteHalf,
+    last_ping: Instant,
     request_rx: UnboundedReceiver<Request>,
+    request_tx: UnboundedSender<Request>,
 }
 
 impl NetworkWriter {
@@ -36,8 +43,10 @@ impl NetworkWriter {
         connection_rx: Receiver<Arc<OwnedWriteHalf>>,
         writer: OwnedWriteHalf,
         request_rx: UnboundedReceiver<Request>,
+        request_tx: UnboundedSender<Request>,
     ) -> Self {
         Self {
+            request_tx,
             request_rx,
             transport: t,
             m,
@@ -46,12 +55,16 @@ impl NetworkWriter {
             write_head: 0,
             write_buffer: DequeBuffer::with_capacity(MAXIMUM_DATA, LEADING_BUFFER_SPACE),
             connection_rx,
+            last_ping: Instant::now(),
         }
     }
     pub fn spawn(mut self) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_micros(100)).await;
+                if self.last_ping.elapsed() > PING_DELAY {
+                    self.send_ping().await;
+                }
                 match self.request_rx.try_recv() {
                     Ok(req) => {
                         self.requests.lock().await.push(req);
@@ -81,6 +94,45 @@ impl NetworkWriter {
             }
             info!("nww closed");
         })
+    }
+
+    async fn send_ping(&mut self) {
+        pub(crate) fn generate_random_id() -> i64 {
+            static LAST_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+            if LAST_ID.load(Ordering::SeqCst) == 0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .expect("system time is before epoch")
+                    .as_nanos() as i64;
+
+                LAST_ID
+                    .compare_exchange(0, now, Ordering::SeqCst, Ordering::SeqCst)
+                    .unwrap();
+            }
+
+            LAST_ID.fetch_add(1, Ordering::SeqCst)
+        }
+        let ping_id = generate_random_id();
+        let (tx, rx) = oneshot::channel();
+        let body = tl::functions::PingDelayDisconnect {
+            ping_id,
+            disconnect_delay: NO_PING_DISCONNECT,
+        }
+        .to_bytes();
+        self.request_tx
+            .send(Request {
+                body,
+                state: RequestState::NotSerialized,
+                result: tx,
+            })
+            .unwrap();
+        tokio::spawn(async move {
+            _=rx.await.unwrap();
+            info!("received ping response ");
+        });
+        info!("sent ping {ping_id}");
+        self.last_ping = Instant::now();
     }
 
     async fn try_write(&mut self) -> Result<(), WriteError> {
